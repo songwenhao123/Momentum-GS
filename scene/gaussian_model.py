@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import math
 import torch
 from functools import reduce
 import numpy as np
@@ -22,6 +23,36 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.embedding import Embedding
+
+
+class SparseMoEDecoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_experts=4, top_k=2):
+        super().__init__()
+        self.top_k = top_k
+        self.num_experts = num_experts
+        self.output_dim = output_dim
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.ReLU(True),
+                nn.Linear(hidden_dim, output_dim),
+            ) for _ in range(num_experts)
+        ])
+
+    def forward(self, x, topk_indices, topk_weights):
+        output = torch.zeros(x.shape[0], self.output_dim, device=x.device, dtype=x.dtype)
+
+        for k_id in range(self.top_k):
+            expert_indices = topk_indices[:, k_id]
+            weights = topk_weights[:, k_id]
+            unique_experts = expert_indices.unique()
+            for expert_id in unique_experts:
+                mask = expert_indices == expert_id
+                if mask.any():
+                    expert_output = self.experts[expert_id](x[mask])
+                    output[mask] += expert_output * weights[mask].unsqueeze(-1)
+
+        return output
 
 
 class GaussianModel:
@@ -44,11 +75,11 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, 
-                 feat_dim: int=32, 
-                 n_offsets: int=5, 
+    def __init__(self,
+                 feat_dim: int=32,
+                 n_offsets: int=5,
                  voxel_size: float=0.01,
-                 update_depth: int=3, 
+                 update_depth: int=3,
                  update_init_factor: int=100,
                  update_hierachy_factor: int=4,
                  use_feat_bank : bool = False,
@@ -57,6 +88,9 @@ class GaussianModel:
                  add_opacity_dist : bool = False,
                  add_cov_dist : bool = False,
                  add_color_dist : bool = False,
+                 num_moe_experts: int = 4,
+                 moe_top_k: int = 2,
+                 moe_hidden_dim: int = 64,
                  ):
 
         self.feat_dim = feat_dim
@@ -73,6 +107,9 @@ class GaussianModel:
         self.add_opacity_dist = add_opacity_dist
         self.add_cov_dist = add_cov_dist
         self.add_color_dist = add_color_dist
+        self.num_moe_experts = num_moe_experts
+        self.moe_top_k = moe_top_k
+        self.moe_hidden_dim = moe_hidden_dim
 
         self.freeze_all_mlp = False
 
@@ -106,27 +143,38 @@ class GaussianModel:
             ).cuda()
 
         self.opacity_dist_dim = 1 if self.add_opacity_dist else 0
-        self.mlp_opacity = nn.Sequential(
-            nn.Linear(feat_dim+3+self.opacity_dist_dim, feat_dim),
+        self.gating_input_dim = feat_dim + 3 + 1
+        self.mlp_gating = nn.Sequential(
+            nn.Linear(self.gating_input_dim, self.moe_hidden_dim),
             nn.ReLU(True),
-            nn.Linear(feat_dim, n_offsets),
-            nn.Tanh()
+            nn.Linear(self.moe_hidden_dim, self.num_moe_experts)
+        ).cuda()
+
+        self.mlp_opacity = SparseMoEDecoder(
+            input_dim=feat_dim+3+self.opacity_dist_dim,
+            hidden_dim=self.moe_hidden_dim,
+            output_dim=n_offsets,
+            num_experts=self.num_moe_experts,
+            top_k=self.moe_top_k,
         ).cuda()
 
         self.add_cov_dist = add_cov_dist
         self.cov_dist_dim = 1 if self.add_cov_dist else 0
-        self.mlp_cov = nn.Sequential(
-            nn.Linear(feat_dim+3+self.cov_dist_dim, feat_dim),
-            nn.ReLU(True),
-            nn.Linear(feat_dim, 7*self.n_offsets),
+        self.mlp_cov = SparseMoEDecoder(
+            input_dim=feat_dim+3+self.cov_dist_dim,
+            hidden_dim=self.moe_hidden_dim,
+            output_dim=7*self.n_offsets,
+            num_experts=self.num_moe_experts,
+            top_k=self.moe_top_k,
         ).cuda()
 
         self.color_dist_dim = 1 if self.add_color_dist else 0
-        self.mlp_color = nn.Sequential(
-            nn.Linear(feat_dim+3+self.color_dist_dim+self.appearance_dim, feat_dim),
-            nn.ReLU(True),
-            nn.Linear(feat_dim, 3*self.n_offsets),
-            nn.Sigmoid()
+        self.mlp_color = SparseMoEDecoder(
+            input_dim=feat_dim+3+self.color_dist_dim+self.appearance_dim,
+            hidden_dim=self.moe_hidden_dim,
+            output_dim=3*self.n_offsets,
+            num_experts=self.num_moe_experts,
+            top_k=self.moe_top_k,
         ).cuda()
 
         
@@ -134,6 +182,7 @@ class GaussianModel:
         self.mlp_opacity.eval()
         self.mlp_cov.eval()
         self.mlp_color.eval()
+        self.mlp_gating.eval()
         if self.appearance_dim > 0:
             self.embedding_appearance.eval()
         if self.use_feat_bank:
@@ -143,9 +192,10 @@ class GaussianModel:
         self.mlp_opacity.train()
         self.mlp_cov.train()
         self.mlp_color.train()
+        self.mlp_gating.train()
         if self.appearance_dim > 0:
             self.embedding_appearance.train()
-        if self.use_feat_bank:                   
+        if self.use_feat_bank:
             self.mlp_feature_bank.train()
 
     def capture(self):
@@ -203,7 +253,11 @@ class GaussianModel:
     @property
     def get_featurebank_mlp(self):
         return self.mlp_feature_bank
-    
+
+    @property
+    def get_gating_mlp(self):
+        return self.mlp_gating
+
     @property
     def get_opacity_mlp(self):
         return self.mlp_opacity
@@ -238,6 +292,20 @@ class GaussianModel:
 
     def get_apperance_embedding(self, idx):
         return self._appearance_embeddings[idx]
+
+
+    def compute_moe_routing(self, gating_input):
+        gating_logits = self.mlp_gating(gating_input)
+        gating_prob = torch.softmax(gating_logits, dim=-1)
+        topk_weights, topk_indices = torch.topk(gating_prob, k=self.moe_top_k, dim=-1)
+
+        with torch.no_grad():
+            selection_mask = torch.zeros_like(gating_prob)
+            selection_mask.scatter_(1, topk_indices, 1.0)
+            q_e = selection_mask.mean(dim=0)
+        balance_loss = (q_e * torch.log(torch.clamp(q_e, min=1e-9))).sum() + math.log(self.num_moe_experts)
+
+        return topk_indices, topk_weights, balance_loss
     
 
     def get_covariance(self, scaling_modifier = 1):
@@ -307,7 +375,8 @@ class GaussianModel:
                     {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
                     {'params': self.mlp_feature_bank.parameters(), 'lr': training_args.mlp_featurebank_lr_init, "name": "mlp_featurebank"},
                     {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
-                    {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"}])
+                    {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
+                    {'params': self.mlp_gating.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_gating"}])
         elif self.appearance_dim > 0:
             l = [
                 {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
@@ -321,7 +390,8 @@ class GaussianModel:
                 l.extend([
                     {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
                     {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
-                    {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"}])
+                    {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
+                    {'params': self.mlp_gating.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_gating"}])
         else:
             l = [
                 {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
@@ -334,7 +404,8 @@ class GaussianModel:
                 l.extend([
                     {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
                     {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
-                    {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"}])
+                    {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
+                    {'params': self.mlp_gating.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_gating"}])
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.anchor_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -388,6 +459,9 @@ class GaussianModel:
                 lr = self.mlp_cov_scheduler_args(iteration)
                 param_group['lr'] = lr
             if param_group["name"] == "mlp_color":
+                lr = self.mlp_color_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if param_group["name"] == "mlp_gating":
                 lr = self.mlp_color_scheduler_args(iteration)
                 param_group['lr'] = lr
             if self.use_feat_bank and param_group["name"] == "mlp_featurebank":
@@ -841,6 +915,8 @@ class GaussianModel:
         for param in self.mlp_cov.parameters():
             param.requires_grad = False
         for param in self.mlp_color.parameters():
+            param.requires_grad = False
+        for param in self.mlp_gating.parameters():
             param.requires_grad = False
         if self.use_feat_bank:
             for param in self.mlp_feature_bank.parameters():

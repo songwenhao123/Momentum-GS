@@ -48,6 +48,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
     cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
+    moe_topk_indices, moe_topk_weights, balance_loss = pc.compute_moe_routing(cat_local_view)
 
     if pc.appearance_dim > 0:
         camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * viewpoint_camera.uid
@@ -55,9 +56,10 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     # get offset's opacity
     if pc.add_opacity_dist:
-        neural_opacity = pc.get_opacity_mlp(cat_local_view) # [N, k]
+        neural_opacity = pc.get_opacity_mlp(cat_local_view, moe_topk_indices, moe_topk_weights) # [N, k]
     else:
-        neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
+        neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist, moe_topk_indices, moe_topk_weights)
+    neural_opacity = torch.tanh(neural_opacity)
 
     # opacity mask generation
     neural_opacity = neural_opacity.reshape([-1, 1])
@@ -70,21 +72,22 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     # get offset's color
     if pc.appearance_dim > 0:
         if pc.add_color_dist:
-            color = pc.get_color_mlp(torch.cat([cat_local_view, appearance], dim=1))
+            color = pc.get_color_mlp(torch.cat([cat_local_view, appearance], dim=1), moe_topk_indices, moe_topk_weights)
         else:
-            color = pc.get_color_mlp(torch.cat([cat_local_view_wodist, appearance], dim=1))
+            color = pc.get_color_mlp(torch.cat([cat_local_view_wodist, appearance], dim=1), moe_topk_indices, moe_topk_weights)
     else:
         if pc.add_color_dist:
-            color = pc.get_color_mlp(cat_local_view)
+            color = pc.get_color_mlp(cat_local_view, moe_topk_indices, moe_topk_weights)
         else:
-            color = pc.get_color_mlp(cat_local_view_wodist)
+            color = pc.get_color_mlp(cat_local_view_wodist, moe_topk_indices, moe_topk_weights)
+    color = torch.sigmoid(color)
     color = color.reshape([anchor.shape[0]*pc.n_offsets, 3])
 
     # get offset's cov
     if pc.add_cov_dist:
-        scale_rot = pc.get_cov_mlp(cat_local_view)
+        scale_rot = pc.get_cov_mlp(cat_local_view, moe_topk_indices, moe_topk_weights)
     else:
-        scale_rot = pc.get_cov_mlp(cat_local_view_wodist)
+        scale_rot = pc.get_cov_mlp(cat_local_view_wodist, moe_topk_indices, moe_topk_weights)
     scale_rot = scale_rot.reshape([anchor.shape[0]*pc.n_offsets, 7])
     
     # offsets
@@ -106,7 +109,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     xyz = repeat_anchor + offsets
 
     if is_training:
-        return xyz, color, opacity, scaling, rot, neural_opacity, mask
+        return xyz, color, opacity, scaling, rot, neural_opacity, mask, balance_loss
     else:
         return xyz, color, opacity, scaling, rot
     
@@ -150,11 +153,13 @@ def generate_neural_gaussians_and_momentum_gaussians(viewpoint_camera, pc : Gaus
 
     # get offset's opacity
     if pc.add_opacity_dist:
-        neural_opacity = pc.get_opacity_mlp(cat_local_view) # [N, k]
-        neural_opacity_main = momentum_mlp_opacity(cat_local_view)
+        neural_opacity = pc.get_opacity_mlp(cat_local_view, moe_topk_indices, moe_topk_weights) # [N, k]
+        neural_opacity_main = momentum_mlp_opacity(cat_local_view, moe_topk_indices, moe_topk_weights)
     else:
-        neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
-        neural_opacity_main = momentum_mlp_opacity(cat_local_view_wodist)
+        neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist, moe_topk_indices, moe_topk_weights)
+        neural_opacity_main = momentum_mlp_opacity(cat_local_view_wodist, moe_topk_indices, moe_topk_weights)
+    neural_opacity = torch.tanh(neural_opacity)
+    neural_opacity_main = torch.tanh(neural_opacity_main)
 
     # opacity mask generation
     neural_opacity = neural_opacity.reshape([-1, 1])
@@ -169,28 +174,30 @@ def generate_neural_gaussians_and_momentum_gaussians(viewpoint_camera, pc : Gaus
     # get offset's color
     if pc.appearance_dim > 0:
         if pc.add_color_dist:
-            color = pc.get_color_mlp(torch.cat([cat_local_view, appearance], dim=1))
-            color_main = momentum_mlp_color(torch.cat([cat_local_view, appearance], dim=1))
+            color = pc.get_color_mlp(torch.cat([cat_local_view, appearance], dim=1), moe_topk_indices, moe_topk_weights)
+            color_main = momentum_mlp_color(torch.cat([cat_local_view, appearance], dim=1), moe_topk_indices, moe_topk_weights)
         else:
-            color = pc.get_color_mlp(torch.cat([cat_local_view_wodist, appearance], dim=1))
-            color_main = momentum_mlp_color(torch.cat([cat_local_view_wodist, appearance], dim=1))
+            color = pc.get_color_mlp(torch.cat([cat_local_view_wodist, appearance], dim=1), moe_topk_indices, moe_topk_weights)
+            color_main = momentum_mlp_color(torch.cat([cat_local_view_wodist, appearance], dim=1), moe_topk_indices, moe_topk_weights)
     else:
         if pc.add_color_dist:
-            color = pc.get_color_mlp(cat_local_view)
-            color_main = momentum_mlp_color(cat_local_view)
+            color = pc.get_color_mlp(cat_local_view, moe_topk_indices, moe_topk_weights)
+            color_main = momentum_mlp_color(cat_local_view, moe_topk_indices, moe_topk_weights)
         else:
-            color = pc.get_color_mlp(cat_local_view_wodist)
-            color_main = momentum_mlp_color(cat_local_view_wodist)
+            color = pc.get_color_mlp(cat_local_view_wodist, moe_topk_indices, moe_topk_weights)
+            color_main = momentum_mlp_color(cat_local_view_wodist, moe_topk_indices, moe_topk_weights)
+    color = torch.sigmoid(color)
+    color_main = torch.sigmoid(color_main)
     color = color.reshape([anchor.shape[0]*pc.n_offsets, 3])
     color_main = color_main.reshape([anchor.shape[0]*pc.n_offsets, 3])
 
     # get offset's cov
     if pc.add_cov_dist:
-        scale_rot = pc.get_cov_mlp(cat_local_view)
-        scale_rot_main = momentum_mlp_cov(cat_local_view)
+        scale_rot = pc.get_cov_mlp(cat_local_view, moe_topk_indices, moe_topk_weights)
+        scale_rot_main = momentum_mlp_cov(cat_local_view, moe_topk_indices, moe_topk_weights)
     else:
-        scale_rot = pc.get_cov_mlp(cat_local_view_wodist)
-        scale_rot_main = momentum_mlp_cov(cat_local_view_wodist)
+        scale_rot = pc.get_cov_mlp(cat_local_view_wodist, moe_topk_indices, moe_topk_weights)
+        scale_rot_main = momentum_mlp_cov(cat_local_view_wodist, moe_topk_indices, moe_topk_weights)
     scale_rot = scale_rot.reshape([anchor.shape[0]*pc.n_offsets, 7])
     scale_rot_main = scale_rot_main.reshape([anchor.shape[0]*pc.n_offsets, 7])
     
@@ -215,7 +222,7 @@ def generate_neural_gaussians_and_momentum_gaussians(viewpoint_camera, pc : Gaus
     xyz = repeat_anchor + offsets
 
     if is_training:
-        return xyz, color, color_main, opacity, scaling, scaling_main, rot, rot_main, neural_opacity, neural_opacity_main, mask
+        return xyz, color, color_main, opacity, scaling, scaling_main, rot, rot_main, neural_opacity, neural_opacity_main, mask, balance_loss
     else:
         return xyz, color, opacity, scaling, rot
     
@@ -230,7 +237,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     if xyz is None:
         if is_training:
-            xyz, color, opacity, scaling, rot, neural_opacity, mask = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+            xyz, color, opacity, scaling, rot, neural_opacity, mask, balance_loss = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
         else:
             xyz, color, opacity, scaling, rot = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
 
@@ -282,6 +289,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "selection_mask": mask,
                 "neural_opacity": neural_opacity,
                 "scaling": scaling,
+                "balance_loss": balance_loss,
                 }
     else:
         return {"render": rendered_image,
@@ -302,7 +310,7 @@ def render_with_consistency_loss(viewpoint_camera, pc : GaussianModel, momentum_
 
     if xyz is None:
         if is_training:
-            xyz, color, color_main, opacity, scaling, scaling_main, rot, rot_main, neural_opacity, neural_opacity_main, mask = generate_neural_gaussians_and_momentum_gaussians(viewpoint_camera, pc, momentum_mlp_color, momentum_mlp_cov, momentum_mlp_opacity, visible_mask, is_training=is_training)
+            xyz, color, color_main, opacity, scaling, scaling_main, rot, rot_main, neural_opacity, neural_opacity_main, mask, balance_loss = generate_neural_gaussians_and_momentum_gaussians(viewpoint_camera, pc, momentum_mlp_color, momentum_mlp_cov, momentum_mlp_opacity, visible_mask, is_training=is_training)
 
             color_loss = torch.nn.functional.mse_loss(color, color_main)
             rot_loss = torch.nn.functional.mse_loss(rot, rot_main)
@@ -367,6 +375,7 @@ def render_with_consistency_loss(viewpoint_camera, pc : GaussianModel, momentum_
                 "rot_loss": rot_loss,
                 "scaling_loss": scaling_loss,
                 "opacity_loss": opacity_loss,
+                "balance_loss": balance_loss,
                 }
     else:
         return {"render": rendered_image,
