@@ -109,7 +109,7 @@ def training(dataset, opt, pipe, dataset_name, saving_iterations, debug_from, wa
     for block_id in range(rank * num_blocks_per_gpu, (rank + 1) * num_blocks_per_gpu):
         print(f"### Start initializing Block {block_id} on rank {rank}")
 
-        gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+        gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.num_moe_experts, dataset.moe_top_k, dataset.moe_hidden_dim)
         
         scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=True, distributed=True, block_id=block_id, val=True)
 
@@ -118,11 +118,13 @@ def training(dataset, opt, pipe, dataset_name, saving_iterations, debug_from, wa
             replace_model(gaussians.mlp_color, gaussians_list[0].mlp_color)
             replace_model(gaussians.mlp_cov, gaussians_list[0].mlp_cov)
             replace_model(gaussians.mlp_opacity, gaussians_list[0].mlp_opacity)
+            replace_model(gaussians.mlp_gating, gaussians_list[0].mlp_gating)
 
         ### sync mlp data with rank 0
         sync_model_with_rank0(gaussians.mlp_color)
         sync_model_with_rank0(gaussians.mlp_cov)
         sync_model_with_rank0(gaussians.mlp_opacity)
+        sync_model_with_rank0(gaussians.mlp_gating)
 
         gaussians.training_setup(opt)
         gaussians.train()
@@ -183,6 +185,7 @@ def training(dataset, opt, pipe, dataset_name, saving_iterations, debug_from, wa
                     replace_model(gaussians.mlp_color, last_gaussians.mlp_color)
                     replace_model(gaussians.mlp_cov, last_gaussians.mlp_cov)
                     replace_model(gaussians.mlp_opacity, last_gaussians.mlp_opacity)
+                    replace_model(gaussians.mlp_gating, last_gaussians.mlp_gating)
                 gaussians.freezen_mlp()
 
             for cur_iter in range(iteration, end_iter):
@@ -192,6 +195,7 @@ def training(dataset, opt, pipe, dataset_name, saving_iterations, debug_from, wa
                         replace_model(gaussians.mlp_color, last_gaussians.mlp_color)
                         replace_model(gaussians.mlp_cov, last_gaussians.mlp_cov)
                         replace_model(gaussians.mlp_opacity, last_gaussians.mlp_opacity)
+                        replace_model(gaussians.mlp_gating, last_gaussians.mlp_gating)
 
                     torch.cuda.synchronize()
                     dist.barrier()
@@ -241,6 +245,7 @@ def training(dataset, opt, pipe, dataset_name, saving_iterations, debug_from, wa
                 Ll1 = l1_loss(image, gt_image)
                 ssim_loss = (1.0 - ssim(image, gt_image))
                 scaling_reg = scaling.prod(dim=1).mean()
+                balance_loss = render_pkg.get("balance_loss", torch.tensor(0.0, device=device))
                 loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01 * scaling_reg
 
                 if not gaussians.freeze_all_mlp:
@@ -287,7 +292,7 @@ def training(dataset, opt, pipe, dataset_name, saving_iterations, debug_from, wa
 
                             recons_weight = torch.tensor(2.0) - torch.exp(-((cur_max_psnr - momentum_psnr)**2 + (cur_max_ssim * 10 - momentum_ssim * 10)**2) / (2 * opt.adaptive_sigma * opt.adaptive_sigma))
 
-                    loss = (loss + consistency_loss * opt.consistency_loss_weight) * recons_weight
+                    loss = (loss + consistency_loss * opt.consistency_loss_weight + balance_loss * opt.lambda_balance) * recons_weight
 
                 loss.backward()
 
@@ -309,6 +314,12 @@ def training(dataset, opt, pipe, dataset_name, saving_iterations, debug_from, wa
                             param.grad = param.grad / num_gpus
 
                         for param in gaussians.mlp_cov.parameters():
+                            torch.distributed.all_reduce(param.grad)
+                            torch.cuda.synchronize()
+                            dist.barrier()
+                            param.grad = param.grad / num_gpus
+
+                        for param in gaussians.mlp_gating.parameters():
                             torch.distributed.all_reduce(param.grad)
                             torch.cuda.synchronize()
                             dist.barrier()

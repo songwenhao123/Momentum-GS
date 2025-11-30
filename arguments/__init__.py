@@ -95,6 +95,11 @@ class ModelParams(ParamGroup):
         self.add_cov_dist = False
         self.add_color_dist = False
 
+        # MoE decoder
+        self.num_moe_experts = 4
+        self.moe_top_k = 2
+        self.moe_hidden_dim = 64
+
         # Distribute
         self.aabb = [-50, -100, -135, 50, 300, -5]
         self.partition_name = ""
@@ -167,6 +172,7 @@ class OptimizationParams(ParamGroup):
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
         self.consistency_loss_weight = 50.0
+        self.lambda_balance = 0.01
         
         # for anchor densification
         self.start_stat = 500

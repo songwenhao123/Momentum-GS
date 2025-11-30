@@ -20,7 +20,7 @@ from utils.partition_utils import contract_to_unisphere, get_default_aabb
 
 
 def block_partitioning(dataset, pipe, iteration, scale=1.0, quiet=False, disable_inblock=False, ply_path=None):
-    gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+    gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.num_moe_experts, dataset.moe_top_k, dataset.moe_hidden_dim)
 
     scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
     cameras = scene.getTrainCameras()

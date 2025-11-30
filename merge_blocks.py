@@ -34,14 +34,14 @@ import matplotlib.pyplot as plt
 
 def merge_blocks(dataset : ModelParams, iteration : int):
     out_dir = dataset.model_path
-    merged_gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+    merged_gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.num_moe_experts, dataset.moe_top_k, dataset.moe_hidden_dim)
     block_num = dataset.block_num
 
     print(f'### block_num = {block_num}')
 
     with torch.no_grad():
         for idx in range(block_num):
-            gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+            gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.num_moe_experts, dataset.moe_top_k, dataset.moe_hidden_dim)
 
             pretrained_pc_path = os.path.join(dataset.model_path, 'point_cloud', f'iteration_{iteration}' , f'point_cloud_block{idx}.ply')
             print(f'### Loading pretrained point cloud from {pretrained_pc_path}')
